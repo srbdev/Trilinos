@@ -1524,6 +1524,152 @@ namespace {
     TEST_EQUALITY_CONST( gblSuccess, 1 );
   }
 
+  // Test BlockCrsMatrix importAndFillComplete
+  TEUCHOS_UNIT_TEST_TEMPLATE_4_DECL( BlockCrsMatrix, importAndFillComplete, Scalar, LO, GO, Node )
+  {
+    auto out_to_screen = Teuchos::getFancyOStream (Teuchos::rcpFromRef (std::cout));
+
+    using Tpetra::Details::gathervPrint;
+    typedef Tpetra::BlockCrsMatrix<Scalar, LO, GO, Node> block_crs_type;
+    typedef Tpetra::CrsGraph<LO, GO, Node> crs_graph_type;
+    typedef Tpetra::Map<LO, GO, Node> map_type;
+    typedef Tpetra::Import<LO, GO, Node> import_type;
+    using Teuchos::REDUCE_MAX;
+
+    std::ostringstream err;
+    int lclErr = 0;
+    int gblErr = 0;
+
+    out << "Testing Tpetra::BlockCrsMatrix importAndFillComplete" << endl;
+    Teuchos::OSTab tab0 (out);
+
+    RCP<const Comm<int> > comm = getDefaultComm ();
+    const int myRank = comm->getRank ();
+    const int numRanks = comm->getSize();
+    const GST INVALID = Teuchos::OrdinalTraits<GST>::invalid ();
+
+    out << "First test: Import a diagonal BlockCrsMatrix from a source row Map "
+           "that has all indices on Process 0, to a target row Map that is "
+           "uniformly distributed over processes. Blocksize=3." << endl;
+    try {
+      const GO indexBase = 0;
+      const LO tgt_num_local_elements = 3;
+      const LO src_num_local_elements = (myRank == 0) ?
+        static_cast<LO> (numRanks*tgt_num_local_elements) :
+        static_cast<LO> (0);
+
+      const int blocksize = 3;
+
+      // Create row Maps for the source and target
+      RCP<const map_type> src_map =
+        rcp (new map_type (INVALID,
+                           src_num_local_elements,
+                           indexBase, comm));
+      RCP<const map_type> tgt_map =
+        rcp (new map_type (INVALID,
+                           tgt_num_local_elements,
+                           indexBase, comm));
+
+      // Create src graph and tgt graph. We manually assemble the tgt_graph
+      // to test against the tgt_mat graph which is created internally
+      // in importAndFillComplete.
+      Teuchos::RCP<crs_graph_type> src_graph =
+        Teuchos::rcp (new crs_graph_type (src_map, 1));
+      Teuchos::RCP<crs_graph_type> tgt_graph_for_testing =
+        Teuchos::rcp (new crs_graph_type (tgt_map, 1));
+
+      // Fill the graphs
+      // SRC
+      for (LO localrow = src_map->getMinLocalIndex(); 
+           localrow<=src_map->getMaxLocalIndex(); 
+           ++localrow) {
+
+        const GO globalrow = src_map->getGlobalElement(localrow);
+        GO globalcol[1];
+        globalcol[0] = globalrow;
+        
+        src_graph->insertGlobalIndices(globalrow, 1, globalcol);
+      }
+      //TGT
+      for (LO localrow = tgt_map->getMinLocalIndex(); 
+           localrow<=tgt_map->getMaxLocalIndex(); 
+           ++localrow) {
+
+        const GO globalrow = tgt_map->getGlobalElement(localrow);
+        GO globalcol[1];
+        globalcol[0] = globalrow;
+        
+        tgt_graph_for_testing->insertGlobalIndices(globalrow, 1, globalcol);
+      }         
+      src_graph->fillComplete();
+      tgt_graph_for_testing->fillComplete();
+
+      // Create BlockCrsMatrix objects. We manually create the target matrix and
+      // directly compare to the result of importAndFillComplete().
+      RCP<block_crs_type> src_mat =
+        rcp (new block_crs_type (*src_graph, blocksize));
+      RCP<block_crs_type> tgt_mat_for_testing =
+        rcp (new block_crs_type (*tgt_graph_for_testing, blocksize));
+ 
+      // Create a simple block diagonal matrix with A(b,b) = [b*b*row,...,+b*b],
+      if (src_num_local_elements != 0) {
+        for (LO localrow = src_map->getMinLocalIndex();
+             localrow <= src_map->getMaxLocalIndex();
+             ++localrow) {
+          const GO globalrow = src_map->getGlobalElement(localrow);
+          LO col_indices[1];  Scalar values[blocksize*blocksize];
+          col_indices[0] = localrow; 
+          for (int b=0; b<blocksize*blocksize; ++b) {
+            values[b] = blocksize*blocksize*globalrow + b;
+          }
+          const LO actual_num_replaces = src_mat->replaceLocalValues(localrow,
+                                                                     col_indices,
+                                                                     values,
+                                                                     1);
+          TEST_EQUALITY_CONST(actual_num_replaces, 1);
+        }
+      }
+      for (LO localrow = tgt_map->getMinLocalIndex();
+           localrow <= tgt_map->getMaxLocalIndex();
+           ++localrow) {
+        const GO globalrow = tgt_map->getGlobalElement(localrow);
+        LO col_indices[1];  Scalar values[blocksize*blocksize];
+        col_indices[0] = localrow; 
+        for (int b=0; b<blocksize*blocksize; ++b) {
+          values[b] = blocksize*blocksize*globalrow + b;
+        }
+        const LO actual_num_replaces = tgt_mat_for_testing->replaceLocalValues(localrow,
+                                                                               col_indices,
+                                                                               values,
+                                                                               1);
+        TEST_EQUALITY_CONST(actual_num_replaces, 1);
+      }
+
+      // Create the importer
+      import_type importer (src_map, tgt_map);
+
+      // Test the all-in-one import and fill complete nonmember
+      // constructor.
+      RCP<block_crs_type> tgt_mat =
+        Tpetra::importAndFillCompleteBlockCrsMatrix<block_crs_type> (src_mat, importer);
+     
+      // TODO: Compare the tgt_mat and tgt_mat->getCrsGraph() to the ones manually created 
+
+     }
+     catch (std::exception& e) { // end of the first test
+       err << "Proc " << myRank << ": " << e.what () << endl;
+       lclErr = 1;
+     }
+
+     reduceAll<int, int> (*comm, REDUCE_MAX, lclErr, outArg (gblErr));
+     TEST_EQUALITY_CONST( gblErr, 0 );
+     if (gblErr != 0) {
+       Tpetra::Details::gathervPrint (out, err.str (), *comm);
+       out << "Above test failed; aborting further tests" << endl;
+       return;
+     }
+   }
+
   // Test BlockCrsMatrix Export for different graphs with different
   // row Maps.  This tests packAndPrepare and unpackAndCombine.
   TEUCHOS_UNIT_TEST_TEMPLATE_4_DECL( BlockCrsMatrix, ExportDiffRowMaps, Scalar, LO, GO, Node )
@@ -2307,6 +2453,7 @@ namespace {
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, getLocalDiagCopy, SCALAR, LO, GO, NODE ) \
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, SetAllToScalar, SCALAR, LO, GO, NODE ) \
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, ImportCopy, SCALAR, LO, GO, NODE ) \
+  TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, importAndFillComplete, SCALAR, LO, GO, NODE ) \
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, ExportDiffRowMaps, SCALAR, LO, GO, NODE ) \
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, point2block, SCALAR, LO, GO, NODE ) \
   TEUCHOS_UNIT_TEST_TEMPLATE_4_INSTANT( BlockCrsMatrix, block2point, SCALAR, LO, GO, NODE )

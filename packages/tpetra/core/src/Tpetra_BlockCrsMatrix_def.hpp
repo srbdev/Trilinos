@@ -946,6 +946,40 @@ public:
   template<class Scalar, class LO, class GO, class Node>
   void
   BlockCrsMatrix<Scalar, LO, GO, Node>::
+  importAndFillComplete (Teuchos::RCP<BlockCrsMatrix<Scalar, LO, GO, Node> >& destMatrix,
+                         const Import<LO, GO, Node>& importer,
+                         const Teuchos::RCP<const map_type>& domainMap,
+                         const Teuchos::RCP<const map_type>& rangeMap,
+                         const Teuchos::RCP<Teuchos::ParameterList>& params) const
+  {
+    using Teuchos::RCP;
+    using Teuchos::rcp;
+    using this_type = BlockCrsMatrix<Scalar, LO, GO, Node>;
+
+    // Right now, we make many assumptions...
+    TEUCHOS_TEST_FOR_EXCEPTION(!destMatrix.is_null(), std::invalid_argument,
+                               "Right now, assuming destMatrix is null.");
+    TEUCHOS_TEST_FOR_EXCEPTION(!domainMap.is_null(), std::invalid_argument,
+                               "Right now, assuming domainMap is null.");
+    TEUCHOS_TEST_FOR_EXCEPTION(!rangeMap.is_null(), std::invalid_argument,
+                               "Right now, assuming rangeMap is null.");
+    TEUCHOS_TEST_FOR_EXCEPTION(!params.is_null(), std::invalid_argument,
+                               "Right now, assuming params is null.");
+
+    // BlockCrsMatrix requires a complete graph at construction.
+    // So first step is to import and fill complete the destGraph.
+    RCP<crs_graph_type> destGraph = rcp (new crs_graph_type (importer.getTargetMap(), 0));
+    destGraph->doImport(this->getCrsGraph(), importer, Tpetra::INSERT);
+    destGraph->fillComplete();
+
+    // Final step, create and import the destMatrix.
+    destMatrix = rcp (new this_type (*destGraph, getBlockSize()));
+    destMatrix->doImport(*this, importer, Tpetra::INSERT);
+  }
+
+  template<class Scalar, class LO, class GO, class Node>
+  void
+  BlockCrsMatrix<Scalar, LO, GO, Node>::
   setAllToScalar (const Scalar& alpha)
   {
     auto val_d = val_.getDeviceView(Access::OverwriteAll);
