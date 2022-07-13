@@ -61,6 +61,7 @@ namespace {
   using Teuchos::reduceAll;
   using Teuchos::RCP;
   using Teuchos::rcp;
+  using Teuchos::ScalarTraits;
   using std::endl;
   typedef Tpetra::global_size_t GST;
 
@@ -1524,11 +1525,158 @@ namespace {
     TEST_EQUALITY_CONST( gblSuccess, 1 );
   }
 
+  // Test that two graphs are same.
+  template<class Graph>
+  bool graphs_are_same(const Graph& G1, const Graph& G2)
+  {
+    typedef typename Graph::local_ordinal_type LO;
+
+    int my_rank = G1.getRowMap()->getComm()->getRank();
+
+    // Make sure each graph is fill complete before checking other properties
+    if (! G1.isFillComplete()) {
+      if (my_rank == 0)
+        std::cerr << "Error: Graph 1 is not fill complete!" << std::endl;
+      return false;
+    }
+    if (! G2.isFillComplete()) {
+      if (my_rank == 0)
+        std::cerr << "Error: Graph 2 is not fill complete!" << std::endl;
+      return false;
+    }
+
+    int errors = 0;
+
+    if (! G1.getRowMap()->isSameAs(*G2.getRowMap())) {
+      if (my_rank == 0)
+        std::cerr << "Error: Graph 1's row map is different than Graph 2's" << std::endl;
+      errors++;
+    }
+    if (! G1.getDomainMap()->isSameAs(*G2.getDomainMap())) {
+      if (my_rank == 0)
+        std::cerr << "Error: Graph 1's domain map is different than Graph 2's" << std::endl;
+      errors++;
+    }
+    if (! G1.getRangeMap()->isSameAs(*G2.getRangeMap())) {
+      if (my_rank == 0)
+        std::cerr << "Error: Graph 1's range map is different than Graph 2's" << std::endl;
+      errors++;
+    }
+    if (G1.getLocalNumEntries() != G2.getLocalNumEntries()) {
+      std::cerr << "Error: Graph 1 does not have the same number of entries as Graph 2 on Process "
+           << my_rank << std::endl;
+      errors++;
+    }
+
+    if (errors != 0) return false;
+
+    for (LO i=0; i<static_cast<LO>(G1.getLocalNumRows()); i++) {
+      typename Graph::local_inds_host_view_type V1, V2;
+      G1.getLocalRowView(i, V1);
+      G2.getLocalRowView(i, V2);
+      if (V1.size() != V2.size()) {
+        std::cerr << "Error: Graph 1 and Graph 2 have different number of entries in local row "
+             << i << " on Process " << my_rank << std::endl;
+        errors++;
+        continue;
+      }
+      int jerr = 0;
+      for (LO j=0; j<static_cast<LO>(V1.size()); j++) {
+        if (V1[j] != V2[j])
+          jerr++;
+      }
+      if (jerr != 0) {
+        std::cerr << "Error: One or more entries in row " << i << " on Process " << my_rank
+             << " Graphs 1 and 2 are not the same" << std::endl;
+        errors++;
+        continue;
+      }
+    }
+
+    return (errors == 0);
+
+  }
+
+  // Test that two matrices' rows have the same entries.
+  template<class BlockCrsMatrixType, class Scalar>
+  bool matrices_are_same(const RCP<BlockCrsMatrixType>& A1,
+                         const RCP<BlockCrsMatrixType>& A2)
+  {
+    // Loop through A1 and make sure each row has the same
+    // entries as A2.  In the fully general case, the
+    // redistribution may have added together values, resulting in
+    // small rounding errors.  This is why we use an error tolerance
+    // (with a little bit of wiggle room).
+
+    int my_rank = A1->getRowMap()->getComm()->getRank();
+
+    using ST = ScalarTraits<Scalar>;
+    using magnitude_type = typename ST::magnitudeType;
+    const magnitude_type tol =
+       Teuchos::as<magnitude_type> (10) * ScalarTraits<magnitude_type>::eps ();
+
+    using LO = typename BlockCrsMatrixType::local_ordinal_type;
+    using lids_type = typename BlockCrsMatrixType::local_inds_host_view_type;
+    using vals_type = typename BlockCrsMatrixType::values_host_view_type;
+
+    // Verify the maps are identical
+    bool maps_same = A1->getRowMap()->isSameAs(*(A2->getRowMap()));
+    if (!maps_same) {
+      if (my_rank==0) std::cerr << "Error: RowMaps are not the same!" << std::endl;
+      return false;
+    }
+
+    // Verify the graphs are identical
+    bool graphs_same = graphs_are_same(A1->getCrsGraph(), A2->getCrsGraph());
+    if (!graphs_same) {
+      if (my_rank==0) std::cerr << "Error: Graphs are not the same!" << std::endl;
+      return false;
+    }
+
+    lids_type A1RowInds;
+    vals_type A1RowVals;
+    lids_type A2RowInds;
+    vals_type A2RowVals;
+    for (LO localrow = A1->getRowMap()->getMinLocalIndex();
+        localrow <= A1->getRowMap()->getMaxLocalIndex();
+        ++localrow)
+    {
+     size_t A1NumEntries = A1->getNumEntriesInLocalRow (localrow);
+     size_t A2NumEntries = A1->getNumEntriesInLocalRow (localrow);
+
+     // Verify the ame number of entries in each row
+     if (A1NumEntries != A2NumEntries) {
+       if (my_rank==0) std::cerr << "Error: Matrices have different number of entries in at least one row!" << std::endl;
+       return false;
+     }
+
+     A1->getLocalRowView (localrow, A1RowInds, A1RowVals);
+     A2->getLocalRowView (localrow, A2RowInds, A2RowVals);
+
+     typedef typename Array<Scalar>::size_type size_type;
+     for (size_type k = 0; k < static_cast<size_type> (A1NumEntries); ++k) {
+
+       // Verify the same column indices
+       if(A1RowInds[k]!=A2RowInds[k]) {
+         if (my_rank==0) std::cerr << "Error: Matrices have different column indices!" << std::endl;
+         return false;
+       }
+
+       // Verify the same matrix values
+       const magnitude_type rel_err = ST::magnitude(A1RowVals[k] - A2RowVals[k]);
+       if(rel_err > tol) {
+         if (my_rank==0) std::cerr << "Error: Matrices have different values!" << std::endl;
+         return false;
+       }
+     }
+    }
+
+    return true;
+  }
+
   // Test BlockCrsMatrix importAndFillComplete
   TEUCHOS_UNIT_TEST_TEMPLATE_4_DECL( BlockCrsMatrix, importAndFillComplete, Scalar, LO, GO, Node )
   {
-    auto out_to_screen = Teuchos::getFancyOStream (Teuchos::rcpFromRef (std::cout));
-
     using Tpetra::Details::gathervPrint;
     typedef Tpetra::BlockCrsMatrix<Scalar, LO, GO, Node> block_crs_type;
     typedef Tpetra::CrsGraph<LO, GO, Node> crs_graph_type;
@@ -1570,17 +1718,10 @@ namespace {
                            tgt_num_local_elements,
                            indexBase, comm));
 
-      // Create src graph and tgt graph. We manually assemble the tgt_graph
-      // to test against the tgt_mat graph which is created internally
-      // in importAndFillComplete.
+      // Build src graph.
       Teuchos::RCP<crs_graph_type> src_graph =
         Teuchos::rcp (new crs_graph_type (src_map, 1));
-      Teuchos::RCP<crs_graph_type> tgt_graph_for_testing =
-        Teuchos::rcp (new crs_graph_type (tgt_map, 1));
-
-      // Fill the graphs
-      // SRC
-      for (LO localrow = src_map->getMinLocalIndex(); 
+      for (LO localrow = src_map->getMinLocalIndex();
            localrow<=src_map->getMaxLocalIndex(); 
            ++localrow) {
 
@@ -1590,28 +1731,11 @@ namespace {
         
         src_graph->insertGlobalIndices(globalrow, 1, globalcol);
       }
-      //TGT
-      for (LO localrow = tgt_map->getMinLocalIndex(); 
-           localrow<=tgt_map->getMaxLocalIndex(); 
-           ++localrow) {
-
-        const GO globalrow = tgt_map->getGlobalElement(localrow);
-        GO globalcol[1];
-        globalcol[0] = globalrow;
-        
-        tgt_graph_for_testing->insertGlobalIndices(globalrow, 1, globalcol);
-      }         
       src_graph->fillComplete();
-      tgt_graph_for_testing->fillComplete();
 
-      // Create BlockCrsMatrix objects. We manually create the target matrix and
-      // directly compare to the result of importAndFillComplete().
+      // Build src matrix. Simple block diagonal matrix with A(b,b) = [b*b*row,...,+b*b].
       RCP<block_crs_type> src_mat =
-        rcp (new block_crs_type (*src_graph, blocksize));
-      RCP<block_crs_type> tgt_mat_for_testing =
-        rcp (new block_crs_type (*tgt_graph_for_testing, blocksize));
- 
-      // Create a simple block diagonal matrix with A(b,b) = [b*b*row,...,+b*b],
+        rcp (new block_crs_type (*src_graph, blocksize)); 
       if (src_num_local_elements != 0) {
         for (LO localrow = src_map->getMinLocalIndex();
              localrow <= src_map->getMaxLocalIndex();
@@ -1629,12 +1753,40 @@ namespace {
           TEST_EQUALITY_CONST(actual_num_replaces, 1);
         }
       }
+
+      // Create the importer
+      import_type importer (src_map, tgt_map);
+
+      // Call importAndFillComplete to get the tgt matrix
+      RCP<block_crs_type> tgt_mat =
+        Tpetra::importAndFillCompleteBlockCrsMatrix<block_crs_type> (src_mat, importer);
+     
+      // Manually build the tgt matrix and test that it matches the returned matrix
+
+      // Build tgt graph.
+      Teuchos::RCP<crs_graph_type> tgt_graph_for_testing =
+        Teuchos::rcp (new crs_graph_type (tgt_map, 1));
+      for (LO localrow = tgt_map->getMinLocalIndex();
+           localrow<=tgt_map->getMaxLocalIndex();
+           ++localrow) {
+
+        const GO globalrow = tgt_map->getGlobalElement(localrow);
+        GO globalcol[1];
+        globalcol[0] = globalrow;
+
+        tgt_graph_for_testing->insertGlobalIndices(globalrow, 1, globalcol);
+      }
+      tgt_graph_for_testing->fillComplete();
+
+      // Build tgt matrix
+      RCP<block_crs_type> tgt_mat_for_testing =
+        rcp (new block_crs_type (*tgt_graph_for_testing, blocksize));
       for (LO localrow = tgt_map->getMinLocalIndex();
            localrow <= tgt_map->getMaxLocalIndex();
            ++localrow) {
         const GO globalrow = tgt_map->getGlobalElement(localrow);
         LO col_indices[1];  Scalar values[blocksize*blocksize];
-        col_indices[0] = localrow; 
+        col_indices[0] = localrow;
         for (int b=0; b<blocksize*blocksize; ++b) {
           values[b] = blocksize*blocksize*globalrow + b;
         }
@@ -1645,16 +1797,9 @@ namespace {
         TEST_EQUALITY_CONST(actual_num_replaces, 1);
       }
 
-      // Create the importer
-      import_type importer (src_map, tgt_map);
-
-      // Test the all-in-one import and fill complete nonmember
-      // constructor.
-      RCP<block_crs_type> tgt_mat =
-        Tpetra::importAndFillCompleteBlockCrsMatrix<block_crs_type> (src_mat, importer);
-     
-      // TODO: Compare the tgt_mat and tgt_mat->getCrsGraph() to the ones manually created 
-
+      // Test that matrices are identical
+      bool matrices_match = matrices_are_same<block_crs_type, Scalar>(tgt_mat, tgt_mat_for_testing);
+      TEST_ASSERT(matrices_match);
      }
      catch (std::exception& e) { // end of the first test
        err << "Proc " << myRank << ": " << e.what () << endl;
